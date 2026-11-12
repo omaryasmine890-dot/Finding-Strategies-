@@ -11,6 +11,8 @@ app = Flask(__name__)
 
 MAX_CANDLES = 50000   # حماية من الطلبات الضخمة
 CHART_CANDLES = 3000  # عدد الشموع المعروضة في الرسم
+FOLDS = 3             # عدد الفترات الزمنية لاختبار الثبات
+DEFAULT_DAYS = 90
 
 PAGE = """<!doctype html>
 <html lang="ar" dir="rtl">
@@ -50,7 +52,7 @@ PAGE = """<!doctype html>
   .stat{background:#0e141b;border:1px solid var(--line);border-radius:11px;padding:10px;text-align:center}
   .stat b{display:block;font-size:17px}
   .stat span{font-size:11px;color:var(--mut)}
-  .up{color:var(--green)}.dn{color:var(--red)}
+  .up{color:var(--green)}.dn{color:var(--red)}.am{color:var(--amber)}
   #chart{height:340px;width:100%;direction:ltr}
   .legend{display:flex;gap:14px;font-size:12px;color:var(--mut);margin-top:8px;flex-wrap:wrap}
   .tabs{display:flex;gap:8px;margin-bottom:10px}
@@ -66,11 +68,17 @@ PAGE = """<!doctype html>
   .cols{display:grid;grid-template-columns:1fr 1fr;gap:8px}
   .box{background:#111a24;border-radius:9px;padding:8px;font-size:12px;color:var(--mut)}
   .box b{display:block;color:var(--txt);font-size:15px;margin-top:2px}
+  .dirbox{margin-top:8px}
+  .dirbox b{font-size:14px}
+  .folds{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;font-size:12px;color:var(--mut);align-items:center}
+  .fold{padding:3px 9px;border-radius:8px;background:#111a24}
+  .fold.ok{color:var(--green)}.fold.no{color:var(--red)}
   .badge{float:left;font-size:11px;padding:3px 9px;border-radius:99px;font-weight:700}
   .badge.good{background:rgba(46,204,113,.16);color:var(--green)}
+  .badge.vol{background:rgba(245,185,66,.16);color:var(--amber)}
   .badge.weak{background:rgba(255,92,92,.14);color:var(--red)}
   .empty{color:var(--mut);text-align:center;padding:18px}
-  .note{color:var(--mut);font-size:12px;line-height:1.7}
+  .note{color:var(--mut);font-size:12px;line-height:1.8}
   #loader{position:fixed;inset:0;background:rgba(5,8,12,.86);display:none;align-items:center;justify-content:center;
           flex-direction:column;gap:14px;z-index:9;font-weight:700}
   .spin{width:44px;height:44px;border-radius:50%;border:4px solid var(--line);border-top-color:var(--green);animation:s 1s linear infinite}
@@ -148,20 +156,28 @@ PAGE = """<!doctype html>
 
 <div class="card">
   <div class="tabs">
-    <button type="button" class="tab buy active" data-t="buy">شراء ({{ res.buy|length }})</button>
-    <button type="button" class="tab sell" data-t="sell">بيع ({{ res.sell|length }})</button>
+    <button type="button" class="tab buy active" data-t="buy">شراء ({{ res.buy|length }}) · موثوقة {{ res.buy_good }}</button>
+    <button type="button" class="tab sell" data-t="sell">بيع ({{ res.sell|length }}) · موثوقة {{ res.sell_good }}</button>
   </div>
-  <label class="toggle"><input type="checkbox" id="onlygood"> إظهار القواعد الموثوقة فقط (نجحت في الاختبار)</label>
+  <label class="toggle"><input type="checkbox" id="onlygood"> إظهار الموثوقة فقط (Lift + اتجاه واضح)</label>
 
   {% for side, rows in [('buy', res.buy), ('sell', res.sell)] %}
   <div class="pane" id="pane-{{ side }}" style="{{ '' if side=='buy' else 'display:none' }}">
     {% for r in rows %}
-    <div class="rule" data-good="{{ 1 if r.good else 0 }}">
-      <span class="badge {{ 'good' if r.good else 'weak' }}">{{ 'نجحت في الاختبار' if r.good else 'ضعيفة في الاختبار' }}</span>
+    <div class="rule" data-good="{{ 1 if r.state=='good' else 0 }}">
+      <span class="badge {{ r.state }}">{{ r.label }}</span>
       <div class="name">{% for part in r.parts %}<span>{{ part }}</span>{% endfor %}</div>
       <div class="cols">
         <div class="box">الاستخراج ({{ r.n }} حالة)<b>{{ r.p }} · Lift {{ r.lift }}</b></div>
-        <div class="box">الاختبار ({{ r.tn }} حالة)<b class="{{ 'up' if r.good else 'dn' }}">{{ r.tp }} · Lift {{ r.tlift }}</b></div>
+        <div class="box">الاختبار ({{ r.tn }} حالة)<b>{{ r.tp }} · Lift {{ r.tlift }}</b></div>
+      </div>
+      <div class="box dirbox">
+        الاتجاه في الاختبار: صعود {{ r.pu }} مقابل هبوط {{ r.pd }}
+        <b class="{{ 'up' if r.dir_ok else 'am' }}">نسبة {{ r.side_name }} من الحركات: {{ r.share }} (الأساس {{ r.bshare }})</b>
+      </div>
+      <div class="folds">
+        <span>الثبات: {{ r.fold_ok }}/{{ r.folds|length }}</span>
+        {% for fo in r.folds %}<span class="fold {{ 'ok' if fo.ok else 'no' }}">فترة {{ loop.index }} · Lift {{ fo.lift }} ({{ fo.n }})</span>{% endfor %}
       </div>
     </div>
     {% else %}
@@ -170,7 +186,13 @@ PAGE = """<!doctype html>
     <div class="empty pane-empty" style="display:none">لا توجد قواعد موثوقة هنا.</div>
   </div>
   {% endfor %}
-  <p class="note">Lift = احتمال الحدث عند تحقق الشرط ÷ احتماله العام. القاعدة الجديرة بالاهتمام هي التي يبقى Lift الاختبار فيها فوق 1 وقريباً من الاستخراج. هذه أداة بحث وليست توصية تداول.</p>
+  <p class="note">
+    <b>Lift</b>: احتمال الحدث عند تحقق الشرط ÷ احتماله العام.<br>
+    <b>موثوقة</b>: Lift الاختبار ≥ 1.1 (15 حالة على الأقل) <b>و</b> نسبة الاتجاه أعلى من الأساس بـ 5 نقاط فأكثر.<br>
+    <b class="am">تقلب فقط</b>: Lift جيد لكن الصعود والهبوط يزيدان معاً، أي لا ميزة اتجاهية.<br>
+    <b>الثبات</b>: الفترة الزمنية مقسومة إلى {{ res.folds_n }} أجزاء متساوية؛ الفترات الأولى تتداخل مع بيانات الاستخراج والأخيرة للاختبار.<br>
+    أداة بحث وليست توصية تداول، ولا تشمل الرسوم والانزلاق.
+  </p>
 </div>
 
 <script>
@@ -226,7 +248,7 @@ document.getElementById('f').addEventListener('submit',()=>{document.getElementB
 
 def defaults():
     c = sm.CONFIG
-    return {"symbol": c["SYMBOL"], "interval": c["INTERVAL"], "days": c["DAYS"],
+    return {"symbol": c["SYMBOL"], "interval": c["INTERVAL"], "days": DEFAULT_DAYS,
             "pct": c["EVENT_PCT"], "candles": c["EVENT_CANDLES"], "combo": c["MAX_COMBO"],
             "start": "", "end": "", "min_samples": c["MIN_SAMPLES"], "min_lift": c["MIN_LIFT"],
             "lookback": c["LOOKBACK"], "train": c["TRAIN_RATIO"]}
@@ -240,16 +262,67 @@ def fmt_num(x):
     return "-" if x is None or x != x else f"{x:.2f}"
 
 
-def to_rows(df, top):
+# ---------------------------------------------------------------------
+#                     إحصاءات الاتجاه والثبات لكل قاعدة
+# ---------------------------------------------------------------------
+def rule_mask(conds, rule):
+    return np.logical_and.reduce([conds[c] for c in rule.split(" + ")])
+
+
+def side_probs(mask, labels, idx):
+    """يرجع: عدد الحالات، احتمال الصعود أولاً، احتمال الهبوط أولاً، والأساس لكل منهما (في الفترة idx)."""
+    valid = idx & ~np.isnan(labels)
+    base = labels[valid]
+    bu = float((base == 1).mean()) if len(base) else np.nan
+    bd = float((base == -1).mean()) if len(base) else np.nan
+    sel = labels[mask & valid]
+    n = int(len(sel))
+    if n == 0:
+        return n, np.nan, np.nan, bu, bd
+    return n, float((sel == 1).mean()), float((sel == -1).mean()), bu, bd
+
+
+def share(pu, pd_, side):
+    tot = pu + pd_
+    if tot != tot or tot <= 0:
+        return np.nan
+    return (pu if side == "buy" else pd_) / tot
+
+
+def to_rows(df, top, side, ctx):
+    conds, labels, test, blocks = ctx["conds"], ctx["labels"], ctx["test"], ctx["blocks"]
     rows = []
     for _, r in df.head(top).iterrows():
+        mask = rule_mask(conds, r["القاعدة"])
         tl = r.get("test_Lift")
         tn = int(r["test_حالات"])
-        good = bool(tl == tl and tl >= 1.1 and tn >= 15)
+
+        _, pu, pd_, bu, bd = side_probs(mask, labels, test)
+        d_share, b_share = share(pu, pd_, side), share(bu, bd, side)
+        edge = (d_share - b_share) if (d_share == d_share and b_share == b_share) else np.nan
+        dir_ok = bool(edge == edge and edge >= 0.05)
+        lift_ok = bool(tl == tl and tl >= 1.1 and tn >= 15)
+
+        folds = []
+        for blk in blocks:
+            n2, pu2, pd2, bu2, bd2 = side_probs(mask, labels, blk)
+            p = pu2 if side == "buy" else pd2
+            b = bu2 if side == "buy" else bd2
+            lift = (p / b) if (n2 > 0 and p == p and b == b and b > 0) else np.nan
+            folds.append({"n": n2, "lift": fmt_num(lift),
+                          "ok": bool(n2 >= 10 and lift == lift and lift >= 1.1)})
+
+        state = "good" if (lift_ok and dir_ok) else ("vol" if lift_ok else "weak")
         rows.append({
             "parts": r["القاعدة"].split(" + "), "n": int(r["الحالات"]),
             "p": fmt_pct(r["النسبة"]), "lift": fmt_num(r["Lift"]),
-            "tn": tn, "tp": fmt_pct(r["test_نسبة"]), "tlift": fmt_num(tl), "good": good,
+            "tn": tn, "tp": fmt_pct(r["test_نسبة"]), "tlift": fmt_num(tl),
+            "pu": fmt_pct(pu), "pd": fmt_pct(pd_),
+            "share": fmt_pct(d_share), "bshare": fmt_pct(b_share),
+            "side_name": "الصعود" if side == "buy" else "الهبوط",
+            "dir_ok": dir_ok, "state": state,
+            "label": {"good": "موثوقة", "vol": "تقلب فقط", "weak": "ضعيفة"}[state],
+            "folds": folds, "fold_ok": sum(1 for f in folds if f["ok"]),
         })
     return rows
 
@@ -305,20 +378,31 @@ def run(form):
 
     labels = sm.label_events(df, cfg["EVENT_PCT"], cfg["EVENT_CANDLES"])
     conds = sm.build_conditions(df, cfg)
-    split = int(len(df) * cfg["TRAIN_RATIO"])
-    train = np.zeros(len(df), bool)
+    size = len(df)
+    split = int(size * cfg["TRAIN_RATIO"])
+    train = np.zeros(size, bool)
     train[:split] = True
     test = ~train
 
+    blocks = []
+    for part in np.array_split(np.arange(size), FOLDS):
+        m = np.zeros(size, bool)
+        m[part] = True
+        blocks.append(m)
+    ctx = {"conds": conds, "labels": labels, "test": test, "blocks": blocks}
+
     rules, bu, bd = sm.mine(conds, labels, train, cfg)
-    res = {"candles": len(df), "ups": int((labels == 1).sum()), "dns": int((labels == -1).sum()),
+    res = {"candles": size, "ups": int((labels == 1).sum()), "dns": int((labels == -1).sum()),
            "bu": f"{bu * 100:.1f}", "bd": f"{bd * 100:.1f}", "buy": [], "sell": [],
+           "buy_good": 0, "sell_good": 0, "folds_n": FOLDS,
            "event": f"±{cfg['EVENT_PCT']}% / {cfg['EVENT_CANDLES']}",
            "chart": build_chart(df, labels)}
     if not rules.empty:
         rules = sm.validate(rules.sort_values("z", ascending=False), conds, labels, test, cfg)
-        res["buy"] = to_rows(rules[rules["الاتجاه"] == "شراء"], 10)
-        res["sell"] = to_rows(rules[rules["الاتجاه"] == "بيع"], 10)
+        res["buy"] = to_rows(rules[rules["الاتجاه"] == "شراء"], 10, "buy", ctx)
+        res["sell"] = to_rows(rules[rules["الاتجاه"] == "بيع"], 10, "sell", ctx)
+        res["buy_good"] = sum(1 for r in res["buy"] if r["state"] == "good")
+        res["sell_good"] = sum(1 for r in res["sell"] if r["state"] == "good")
     return res
 
 
