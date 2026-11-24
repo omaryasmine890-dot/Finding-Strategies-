@@ -1,15 +1,17 @@
+import hmac
+import json
 import os
-import time
 
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, Response, jsonify, request, send_from_directory
 
+import backtest as bt
 import bot
-import strategy as st
 
 app = Flask(__name__, static_folder="static")
 bot.start()
 
-MAX_CANDLES = 15000  # حد أقصى لعدد الشموع في الاختبار الواحد (لتفادي انتهاء المهلة)
+MAX_CANDLES = int(os.getenv("MAX_CANDLES", "30000"))   # حد أقصى لعدد الشموع في اختبار واحد
+BT_COST = float(os.getenv("BT_COST", "0.3"))
 
 
 def authorized(data):
@@ -20,6 +22,11 @@ def authorized(data):
 @app.route("/")
 def index():
     return send_from_directory("static", "index.html")
+
+
+@app.route("/health")
+def health():
+    return "ok"
 
 
 @app.route("/api/state")
@@ -33,7 +40,7 @@ def config():
     if not authorized(data):
         return jsonify(error="كلمة المرور غير صحيحة"), 403
     try:
-        bot.update_cfg(data.get("cfg", {}))
+        bot.update_cfg({k: v for k, v in data.items() if k != "password"})
     except (ValueError, TypeError) as e:
         return jsonify(error=str(e)), 400
     return jsonify(ok=True)
@@ -54,32 +61,67 @@ def pause():
     return jsonify(ok=True, paused=bot.toggle_pause())
 
 
-@app.route("/health")
-def health():
-    return "ok"
-
-
 @app.route("/api/backtest", methods=["POST"])
 def backtest():
+    fail = lambda m: (jsonify(error=m, total_trades=0), 200)
     try:
         data = request.get_json(silent=True) or {}
-        cfg = dict(bot.snapshot()["cfg"])
-        tf = str(data.get("interval") or cfg["tf"])
-        if tf not in st.TFM:
-            return jsonify(error="فريم غير مدعوم: %s" % tf, total_trades=0, win_rate=0), 200
-        days = int(data.get("days") or 30)
-        days = max(1, min(days, MAX_CANDLES * st.TFM[tf] // 1440))
-        start = int(time.time() * 1000) - days * st.DAY
-        cs, src = st.fetch_range(cfg["exchange"], cfg["symbol"], tf, start)
-        if len(cs) < 100:
-            return jsonify(error="بيانات غير كافية", total_trades=0, win_rate=0), 200
-        daily, _ = st.fetch_range(src, cfg["symbol"], "D", start - 3 * st.DAY)
-        s = st.summarize(st.backtest(cs, daily, cfg))
-        return jsonify(total_trades=s["n"], tp1_hits=s["tp1"], tp2_wins=s["tp2"], tp1_stop=s["stop1"],
-                       sl_losses=s["sl"], win_rate=s["win"] or 0, total_pct=s["pnl"], total_r=s["r"],
-                       src=src, days_used=days, candles=len(cs))
+        tf = str(data.get("interval") or bot.CFG["tf"]).strip()
+        tf = "D" if tf.lower() == "d" else tf
+        if tf not in bot.TF_MIN:
+            return fail("فريم غير مدعوم: %s" % tf)
+        try:
+            cost = float(data["cost"]) if str(data.get("cost", "")).strip() else BT_COST
+        except (TypeError, ValueError):
+            return fail("قيمة السبريد غير صحيحة")
+        cost = max(0.0, cost)
+        days = max(1, int(data.get("days") or 30))
+        days = min(days, max(1, MAX_CANDLES * bot.TF_MIN[tf] // 1440))
+        try:
+            cs = bot.fetch_history(tf, days)
+        except Exception as e:      # يشمل feed.Pending (التاريخ قيد التحميل من الـ EA)
+            return fail(str(e))
+        cs = cs[:-1]                # آخر شمعة غير مغلقة
+        if len(cs) < 150:
+            return fail("بيانات غير كافية (%d شمعة)" % len(cs))
+        cfg = dict(bot.CFG)
+        trades, _ = bt.simulate(cs, cfg)
+        out = bt.stats(trades, cs, cfg, cost)
+        out.update(timeframe=tf, days_used=days, source=bot.CFG["source"], symbol=bot.symbol())
+        return jsonify(out)
     except Exception as e:
-        return jsonify(error=str(e), total_trades=0, win_rate=0), 200
+        return fail(str(e))
+
+
+# ---------------------------------------------------------------------
+# الربط مع MetaTrader 5 (نفس نقاط الـ EA الحالي: الدفع والمزامنة)
+# ---------------------------------------------------------------------
+def mt5_authorized():
+    key = bot.MT5["key"]
+    given = str(request.args.get("key", ""))
+    return bool(key) and hmac.compare_digest(given.encode(), key.encode())
+
+
+@app.route("/api/mt5/push", methods=["POST"])
+def mt5_push():
+    if bot.feed is None:
+        return jsonify(error="feed.py غير موجود"), 500
+    if not mt5_authorized():
+        return jsonify(error="مفتاح MT5 غير صحيح أو غير مضبوط"), 403
+    d = request.get_json(silent=True, force=True) or {}
+    try:
+        bot.feed.push(d["symbol"], d["tf"], d.get("bars", []), d.get("bid", 0), d.get("ask", 0),
+                      d.get("mode", "live"), d.get("days", 0), bool(d.get("last", 0)))
+    except (KeyError, ValueError, TypeError) as e:
+        return jsonify(error="بيانات غير صالحة: %s" % e), 400
+    return jsonify(ok=True)
+
+
+@app.route("/api/mt5/sync")
+def mt5_sync():
+    if not mt5_authorized():
+        return jsonify(error="مفتاح MT5 غير صحيح أو غير مضبوط"), 403
+    return Response(json.dumps(bot.mt5_sync(), separators=(",", ":")), mimetype="application/json")
 
 
 if __name__ == "__main__":
