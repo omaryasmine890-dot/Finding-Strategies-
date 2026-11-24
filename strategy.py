@@ -1,175 +1,114 @@
+"""استراتيجية F-INVEST (إعادة بناء من إعدادات المؤشر في الفيديو).
+
+القواعد (لكل شمعة مغلقة i):
+  1) الاتجاه (Impulse): المتوسط السريع (RMA 50) فوق البطيء (RMA 112) = صاعد، والعكس = هابط.
+  2) الإشارة (نوع الدخول entry):
+       - "fast"  : الإغلاق يقطع المتوسط السريع في اتجاه الترند (افتراضي)
+       - "cross" : المتوسط السريع يقطع البطيء
+     والشمعة يجب أن تُغلق في اتجاه الصفقة (خضراء للشراء، حمراء للبيع).
+  3) فلتر الحجم الذكي: حجم الشمعة > المستوى × متوسط حجم آخر N شمعة.
+  4) تأكيد الزخم (اختياري، مطفأ افتراضياً): لا شراء إذا RSI فوق التشبع الشرائي، ولا بيع إذا RSI تحت التشبع البيعي.
+
+كل الحسابات تُجرى مرة واحدة على السلسلة كاملة، فيستعملها البوت والباكتيست بنفس الطريقة.
 """
-الدخول على فريم صغير (15 دقيقة افتراضياً):
-  بيع : سحب سيولة فوق القمة ثم إغلاق شمعة داخل المدى  → هدف 1 = 50% ، هدف 2 = القاع
-  شراء: سحب سيولة تحت القاع ثم إغلاق شمعة داخل المدى → هدف 1 = 50% ، هدف 2 = القمة
-لا تداول إذا كان السعر يتذبذب حول مستوى 50%.
-"""
-import time
 
-import requests
-
-DAY = 86400000
-TFM = {"1": 1, "3": 3, "5": 5, "15": 15, "30": 30, "60": 60}
-BYBIT = "https://api.bybit.com/v5/market/kline"
-BINANCE = "https://data-api.binance.vision/api/v3/klines"
-
-DEF = {"exchange": "bybit", "symbol": "BTCUSDT", "tf": "15",
-       "sl_buf": 0.05,   # هامش إضافي للوقف خلف قمة/قاع السحب (% من السعر)
-       "be_on": 1,       # نقل الوقف إلى الدخول بعد TP1
-       "once": 1,        # صفقة واحدة لكل اتجاه في اليوم
-       "chop_on": 1, "chop_n": 24, "chop_x": 4}   # فلتر التذبذب حول 50%
+DEFAULTS = {
+    "vol_on": 1, "vol_level": 1.0, "vol_n": 10,
+    "imp_on": 1, "fast": 50, "slow": 112, "ma_mode": "rma", "src": "close", "entry": "fast",
+    "mom_on": 0, "rsi_n": 11, "ob": 65.0, "os": 38.0,
+    "sl": 10.0, "tp": 5.0,
+}
 
 
-# ---------------------------------------------------------------- البيانات
-def _page(ex, symbol, tf, end_ms, limit):
-    """صفحة شموع مرتبة من الأقدم للأحدث: [{t,o,h,l,c,v}]."""
-    if ex == "bybit":
-        p = {"category": "linear", "symbol": symbol, "interval": "D" if tf == "D" else tf, "limit": limit}
-        if end_ms:
-            p["end"] = end_ms
-        j = requests.get(BYBIT, params=p, timeout=15).json()
-        if j.get("retCode") != 0:
-            raise RuntimeError(j.get("retMsg", "bybit error"))
-        rows = list(reversed(j["result"]["list"]))
-    else:
-        iv = {"D": "1d", "60": "1h"}.get(tf, tf + "m")
-        p = {"symbol": symbol, "interval": iv, "limit": limit}
-        if end_ms:
-            p["endTime"] = end_ms
-        j = requests.get(BINANCE, params=p, timeout=15).json()
-        if not isinstance(j, list):
-            raise RuntimeError(str(j.get("msg", "binance error")))
-        rows = j
-    return [{"t": int(k[0]), "o": float(k[1]), "h": float(k[2]), "l": float(k[3]),
-             "c": float(k[4]), "v": float(k[5])} for k in rows]
+def _src(c, kind):
+    if kind == "hl2":
+        return (c["h"] + c["l"]) / 2
+    if kind == "hlc3":
+        return (c["h"] + c["l"] + c["c"]) / 3
+    if kind == "ohlc4":
+        return (c["o"] + c["h"] + c["l"] + c["c"]) / 4
+    return c["c"]
 
 
-def _order(ex):
-    return [ex, "binance" if ex == "bybit" else "bybit"]   # عند فشل منصة نجرّب الأخرى
+def ma(xs, n, mode="rma"):
+    """RMA / EMA / SMA بنفس طريقة TradingView (البداية بمتوسط بسيط). القيم قبل n = None."""
+    n = max(1, int(n))
+    out = [None] * len(xs)
+    if len(xs) < n:
+        return out
+    if mode == "sma":
+        s = sum(xs[:n])
+        out[n - 1] = s / n
+        for i in range(n, len(xs)):
+            s += xs[i] - xs[i - n]
+            out[i] = s / n
+        return out
+    a = 1.0 / n if mode == "rma" else 2.0 / (n + 1)
+    v = sum(xs[:n]) / n
+    out[n - 1] = v
+    for i in range(n, len(xs)):
+        v = a * xs[i] + (1 - a) * v
+        out[i] = v
+    return out
 
 
-def fetch_recent(ex, symbol, tf, n=200):
-    last = None
-    for e in _order(ex):
-        try:
-            p = _page(e, symbol, tf, None, n)
-            if p:
-                return p, e
-        except Exception as x:
-            last = x
-    raise RuntimeError("تعذّر جلب البيانات: %s" % last)
+def rsi(cl, n):
+    out = [None] * len(cl)
+    if len(cl) <= n:
+        return out
+    g = l = 0.0
+    for i in range(1, n + 1):
+        d = cl[i] - cl[i - 1]
+        g += max(d, 0); l += max(-d, 0)
+    g /= n; l /= n
+    out[n] = 100.0 if l == 0 else 100 - 100 / (1 + g / l)
+    for i in range(n + 1, len(cl)):
+        d = cl[i] - cl[i - 1]
+        g = (g * (n - 1) + max(d, 0)) / n
+        l = (l * (n - 1) + max(-d, 0)) / n
+        out[i] = 100.0 if l == 0 else 100 - 100 / (1 + g / l)
+    return out
 
 
-def fetch_range(ex, symbol, tf, start_ms):
-    last = None
-    for e in _order(ex):
-        try:
-            out, end = [], int(time.time() * 1000)
-            while end > start_ms:
-                page = _page(e, symbol, tf, end, 1000)
-                if not page:
-                    break
-                out.extend(page)
-                end = page[0]["t"] - 1
-            if not out:
-                raise RuntimeError("لا توجد بيانات")
-            d = {c["t"]: c for c in out}
-            return [d[k] for k in sorted(d) if k >= start_ms], e
-        except Exception as x:
-            last = x
-    raise RuntimeError("تعذّر جلب البيانات: %s" % last)
-
-
-# ---------------------------------------------------------------- المنطق
-def day_levels(daily):
-    """{بداية اليوم: (قمة, قاع, 50%)} مأخوذة من شمعة اليوم السابق."""
-    return {c["t"] + DAY: (c["h"], c["l"], (c["h"] + c["l"]) / 2) for c in daily if c["h"] > c["l"]}
-
-
-def signal(cs, i, lv, cfg):
-    """يفحص الشمعة المغلقة رقم i ويعيد إشارة أو None."""
-    if i < 1:
-        return None
-    H, L, M = lv
-    c, p = cs[i], cs[i - 1]
-    if int(cfg.get("chop_on", 1)):
-        seg = cs[max(0, i - int(cfg.get("chop_n", 24))):i + 1]
-        x = sum(1 for a, b in zip(seg, seg[1:]) if (a["c"] - M) * (b["c"] - M) < 0)
-        if x >= int(cfg.get("chop_x", 4)):
-            return None
-    buf = float(cfg.get("sl_buf", 0.05)) / 100
-    e = c["c"]
-    # بيع: سحب فوق القمة ثم إغلاق داخل المدى
-    if (c["h"] > H and e < H) or (p["c"] >= H and e < H):
-        top = max(c["h"], p["h"]) if p["h"] > H else c["h"]
-        if e > M:
-            return {"side": "SELL", "e": e, "sl": top * (1 + buf), "tp1": M, "tp2": L}
-    # شراء: سحب تحت القاع ثم إغلاق داخل المدى
-    if (c["l"] < L and e > L) or (p["c"] <= L and e > L):
-        bot = min(c["l"], p["l"]) if p["l"] < L else c["l"]
-        if e < M:
-            return {"side": "BUY", "e": e, "sl": bot * (1 - buf), "tp1": M, "tp2": H}
-    return None
-
-
-def make_trade(sg, t):
-    return {"side": sg["side"], "s": 1 if sg["side"] == "BUY" else -1, "e": sg["e"], "sl": sg["sl"],
-            "sl0": sg["sl"], "tp1": sg["tp1"], "tp2": sg["tp2"], "stage": 0, "t": t}
-
-
-def _pct(t, x):
-    return t["s"] * (x - t["e"]) / t["e"] * 100
-
-
-def _done(t, outcome, pnl):
-    risk = abs(t["e"] - t["sl0"]) / t["e"] * 100 or 1
-    return {"side": t["side"], "e": t["e"], "t0": t["t"], "outcome": outcome,
-            "pnl": round(pnl, 3), "r": round(pnl / risk, 2)}
-
-
-def advance(t, hi, lo, cfg):
-    """يحرّك الصفقة بأعلى/أدنى سعر. نصف الكمية يُغلق عند TP1 والنصف الآخر عند TP2.
-    الوقف يُفحص أولاً عند التلامس في نفس الشمعة (تقدير متحفظ). يعيد نتيجة عند الإغلاق."""
-    s = t["s"]
-    worst, best = (lo, hi) if s == 1 else (hi, lo)
-    if s * (worst - t["sl"]) <= 0:
-        if t["stage"] == 0:
-            return _done(t, "SL", _pct(t, t["sl"]))
-        return _done(t, "TP1_STOP", 0.5 * _pct(t, t["tp1"]) + 0.5 * _pct(t, t["sl"]))
-    if t["stage"] == 0 and s * (best - t["tp1"]) >= 0:
-        t["stage"] = 1
-        if int(cfg.get("be_on", 1)):
-            t["sl"] = t["e"]
-    if t["stage"] == 1 and s * (best - t["tp2"]) >= 0:
-        return _done(t, "TP2", 0.5 * _pct(t, t["tp1"]) + 0.5 * _pct(t, t["tp2"]))
-    return None
-
-
-def backtest(cs, daily, cfg):
-    lvmap, res, pos, used = day_levels(daily), [], None, set()
-    for i in range(1, len(cs)):
+def compute(cs, cfg):
+    """cs: شموع مغلقة من الأقدم للأحدث. يرجع السلاسل والإشارات (sig[i] = 'BUY' / 'SELL' / None)."""
+    p = dict(DEFAULTS); p.update({k: v for k, v in (cfg or {}).items() if k in DEFAULTS})
+    src = [_src(c, p["src"]) for c in cs]
+    fast = ma(src, p["fast"], p["ma_mode"])
+    slow = ma(src, p["slow"], p["ma_mode"])
+    R = rsi([c["c"] for c in cs], int(p["rsi_n"]))
+    vn = max(1, int(p["vol_n"]))
+    vol = [float(c.get("v") or 0) for c in cs]
+    sig = [None] * len(cs)
+    vs = 0.0
+    for i in range(len(cs)):
+        vs += vol[i]
+        if i >= vn:
+            vs -= vol[i - vn]
+        if i < 1 or fast[i] is None or slow[i] is None or fast[i - 1] is None or slow[i - 1] is None:
+            continue
         c = cs[i]
-        day = c["t"] - c["t"] % DAY
-        if pos:   # الدخول عند إغلاق الشمعة، والإدارة تبدأ من التي بعدها
-            r = advance(pos, c["h"], c["l"], cfg)
-            if r:
-                res.append(r)
-                pos = None
-            continue
-        lv = lvmap.get(day)
-        if not lv:
-            continue
-        sg = signal(cs, i, lv, cfg)
-        if sg and not (int(cfg.get("once", 1)) and (day, sg["side"]) in used):
-            used.add((day, sg["side"]))
-            pos = make_trade(sg, c["t"])
-    return res
-
-
-def summarize(res):
-    n = len(res)
-    cnt = lambda k: sum(1 for r in res if r["outcome"] == k)
-    tp2, stop1, sl = cnt("TP2"), cnt("TP1_STOP"), cnt("SL")
-    return {"n": n, "tp1": tp2 + stop1, "tp2": tp2, "stop1": stop1, "sl": sl,
-            "pnl": round(sum(r["pnl"] for r in res), 2), "r": round(sum(r["r"] for r in res), 2),
-            "win": round(sum(1 for r in res if r["pnl"] > 0) / n * 100, 1) if n else None}
+        # 3) الحجم
+        if int(p["vol_on"]):
+            if i < vn - 1:
+                continue
+            if vol[i] <= float(p["vol_level"]) * (vs / vn):
+                continue
+        # 1) + 2) الاتجاه والإشارة
+        up, dn = fast[i] > slow[i], fast[i] < slow[i]
+        if p["entry"] == "cross":
+            b = fast[i - 1] <= slow[i - 1] and fast[i] > slow[i]
+            s = fast[i - 1] >= slow[i - 1] and fast[i] < slow[i]
+        else:
+            b = src[i - 1] <= fast[i - 1] and src[i] > fast[i]
+            s = src[i - 1] >= fast[i - 1] and src[i] < fast[i]
+        if int(p["imp_on"]):
+            b, s = b and up, s and dn
+        b = b and c["c"] > c["o"]
+        s = s and c["c"] < c["o"]
+        # 4) الزخم
+        if int(p["mom_on"]) and R[i] is not None:
+            b = b and R[i] < float(p["ob"])
+            s = s and R[i] > float(p["os"])
+        sig[i] = "BUY" if b else ("SELL" if s else None)
+    return {"sig": sig, "fast": fast, "slow": slow, "rsi": R}
